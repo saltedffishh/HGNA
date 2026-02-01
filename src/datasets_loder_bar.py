@@ -39,17 +39,28 @@ def load_dataset_pairs(dataset_name):
     加载指定数据集下的 matrix (.txt) 和 metadata (.csv)
     特性：支持单文件内部进度条显示 (分块读取)
     """
-    root_dir = get_project_root()
+    root_dir = get_project_root() # 获取 HGNA 根目录
     
-    # --- 1. 智能路径匹配 ---
+    # --- 1. 智能路径匹配 (修改版) ---
+    # 我们增加了对 "datasets" 文件夹的搜索
     possible_paths = [
+        # 优先级 1: HGNA/datasets/COVID19 (这是你现在的结构)
+        os.path.join(root_dir, "datasets", dataset_name),
+        
+        # 优先级 2: HGNA/datasets/COVID19_data (防止你文件夹名字带_data后缀)
+        os.path.join(root_dir, "datasets", f"{dataset_name}_data"),
+        
+        # 优先级 3: 兼容旧模式 (直接在根目录下找)
         os.path.join(root_dir, dataset_name),
         os.path.join(root_dir, f"{dataset_name}_data")
     ]
+    
+    # 自动在上面列表中寻找第一个存在的路径
     target_path = next((p for p in possible_paths if os.path.exists(p)), None)
             
     if not target_path:
-        print(f"❌ 错误: 未找到目录 '{dataset_name}' 或 '{dataset_name}_data'")
+        # 更新报错信息，提示用户我们去 datasets 找过了
+        print(f"❌ 错误: 在 'datasets' 文件夹或根目录下未找到 '{dataset_name}'")
         sys.exit(1)
 
     # --- 2. 搜索文件并排序 ---
