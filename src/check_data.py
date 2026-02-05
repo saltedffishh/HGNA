@@ -5,7 +5,7 @@ import sys
 
 # 引入你刚才写的加载器
 # 假设你的加载脚本叫 datasets_loder.py (在同一目录下)
-from datasets_loder_bar import load_dataset_pairs
+from datasets_loader_bar import load_dataset_pairs
 
 def check_data_quality(expr_list, meta_list, names):
     """

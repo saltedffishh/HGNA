@@ -3,7 +3,7 @@
 import argparse
 import yaml
 
-from datasets_loder_bar import load_dataset_pairs
+from datasets_loader_bar import load_dataset_pairs
 from utils import knn_build
 from utils.paths import (
     create_experiment_dir,

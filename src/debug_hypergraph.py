@@ -17,7 +17,7 @@ import scipy.sparse as sp
 
 from utils.paths import get_experiments_root
 from utils.io import load_sparse_matrix
-from datasets_loder_bar import load_dataset_pairs
+from datasets_loader_bar import load_dataset_pairs
 from utils.io import load_expr_matrix
 
 
