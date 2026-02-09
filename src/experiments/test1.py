@@ -19,6 +19,7 @@ from utils.io import (
 )
 from utils.knn_build import build_knn_graph_from_expr
 from datasets_loader_bar import load_dataset_pairs
+from align_clusters import align_adjacent_stages
 
 
 def knn_mse_loss(Z, knn_idx):
@@ -93,22 +94,25 @@ def pick_device(prefer="auto"):
     return torch.device("cpu")
 
 
-def ensure_expr_cache(exp_dir, stage, dataset=None):
+def ensure_expr_cache(exp_dir, stage, dataset=None, exprs=None):
     expr_path = get_expr_cache_path(exp_dir, stage)
     if expr_path.exists():
         X, cells, genes = load_expr_matrix(expr_path)
         return X, cells, genes
 
-    if dataset is None:
+    if dataset is None and exprs is None:
         raise FileNotFoundError(
             f"表达矩阵缓存不存在: {expr_path}. "
             "请提供 --dataset 以从原始数据构建。"
         )
 
     expr_path.parent.mkdir(parents=True, exist_ok=True)
-    exprs, metas, names = load_dataset_pairs(dataset)
+    if exprs is None:
+        exprs, metas, names = load_dataset_pairs(dataset)
     if stage < 0 or stage >= len(exprs):
-        raise IndexError(f"stage 超出范围: {stage}, 可用范围: [0, {len(exprs)-1}]")
+        raise IndexError(
+            f"stage 超出范围: {stage}, 可用范围: [0, {len(exprs)-1}]"
+        )
 
     expr_df = exprs[stage]
     X = expr_df.T.values  # cells × genes
@@ -189,13 +193,22 @@ def train_one_stage(
     gmm_covariance="diag",
     gmm_prob_thresh=0.5,
     gmm_max_edges=None,
+    gmm_select=None,
+    gmm_min_clusters=2,
+    gmm_max_clusters=30,
+    exprs=None,
 ):
     exp_dir = get_experiments_root() / exp_name
     if not exp_dir.exists():
         raise FileNotFoundError(f"实验目录不存在: {exp_dir}")
 
     # 1) 读取或构建表达矩阵 X（cells × genes），作为节点特征
-    X, cells, genes = ensure_expr_cache(exp_dir, stage, dataset=dataset)
+    X, cells, genes = ensure_expr_cache(
+        exp_dir,
+        stage,
+        dataset=dataset,
+        exprs=exprs,
+    )
 
     # 2) 读取或构建超图 H/dv/de（ICA-based）
     H, dv, de = ensure_hypergraph(
@@ -256,18 +269,58 @@ def train_one_stage(
         print(f"epoch {epoch} loss={loss.item():.10f}")
     
     print("Z mean:", Z.abs().mean().item())
+    # -----------------------------
+    # 保存模型权重和完整 checkpoint
+    # -----------------------------
+    ckpt_dir = exp_dir / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    model_path = ckpt_dir / f"stage{stage}_model.pt"
+    ckpt_path = ckpt_dir / f"stage{stage}_checkpoint.pt"
+
+    torch.save(model.state_dict(), model_path)
+    torch.save(
+        {
+            "stage": stage,
+            "epoch": 50,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": opt.state_dict(),
+            "loss": float(loss.item()),
+            "config": {
+                "hidden_dim": hidden_dim,
+                "out_dim": out_dim,
+                "k": k,
+                "pca_dim": pca_dim,
+                "n_programs": n_programs,
+                "ica_max_iter": ica_max_iter,
+                "abs_weight": abs_weight,
+                "keep_percentile": keep_percentile,
+                "cluster_mode": cluster_mode,
+                "n_clusters": n_clusters,
+                "gmm_covariance": gmm_covariance,
+                "gmm_prob_thresh": gmm_prob_thresh,
+                "gmm_max_edges": gmm_max_edges,
+                "gmm_select": gmm_select,
+                "gmm_min_clusters": gmm_min_clusters,
+                "gmm_max_clusters": gmm_max_clusters,
+            },
+        },
+        ckpt_path,
+    )
+    print(f"Saved model state_dict to: {model_path}")
+    print(f"Saved full checkpoint to: {ckpt_path}")
 
     # -------------------------------------------------
     # 节点聚类（两种模式）
     # -------------------------------------------------
     Z_np = Z.detach().cpu().numpy()
+    node_labels = None
     if cluster_mode == "hard_nodes":
         print("\n[Clustering] Hard clustering on nodes (KMeans)")
         node_labels = hard_cluster_nodes(Z_np, n_clusters=n_clusters, random_state=0)
         print("Node cluster sizes:", np.bincount(node_labels))
     elif cluster_mode == "soft_hyperedges":
         print("\n[Clustering] Soft clustering on hyperedges (GMM)")
-        node_clusters, edge_probs = soft_cluster_hyperedges(
+        node_clusters, edge_probs, n_clusters_used = soft_cluster_hyperedges(
             Z_np,
             H_sp,
             de,
@@ -276,33 +329,61 @@ def train_one_stage(
             prob_thresh=gmm_prob_thresh,
             max_edges=gmm_max_edges,
             random_state=0,
+            select_n_clusters=gmm_select,
+            min_clusters=gmm_min_clusters,
+            max_clusters=gmm_max_clusters,
         )
 
-        for c in range(n_clusters):
+        print(f"[Clustering] GMM selected n_clusters={n_clusters_used}")
+        for c in range(n_clusters_used):
             print(f"Cluster {c}: nodes={len(node_clusters[c])}, edges~={np.sum(edge_probs[:, c] >= gmm_prob_thresh)}")
+        # build node_labels from soft assignments for visualization
+        node_labels = np.full(Z_np.shape[0], -1, dtype=np.int64)
+        for c in range(n_clusters):
+            node_labels[np.array(node_clusters[c], dtype=np.int64)] = c
     else:
         raise ValueError(f"未知聚类模式: {cluster_mode}")
 
+    # 保存 embeddings 与聚类标签
+    align_dir = exp_dir / "align"
+    align_dir.mkdir(parents=True, exist_ok=True)
+    z_path = align_dir / f"stage{stage}_Z.npy"
+    np.save(z_path, Z_np)
+    if node_labels is not None:
+        labels_path = align_dir / f"stage{stage}_labels.npy"
+        np.save(labels_path, node_labels)
+    print(f"Saved Z to: {z_path}")
+    if node_labels is not None:
+        print(f"Saved labels to: {labels_path}")
 
-    #绘图
-    # 1. 把学到的 Z 转成 AnnData
-    adata = anndata.AnnData(X=Z.detach().cpu().numpy())
 
-    # 2. 算一下邻居和 UMAP
-    print("Running UMAP for visualization...")
-    sc.pp.neighbors(adata, use_rep='X', n_neighbors=15)
-    sc.tl.umap(adata)
+    # #绘图
+    # # 1. 把学到的 Z 转成 AnnData
+    # adata = anndata.AnnData(X=Z.detach().cpu().numpy())
+    # if node_labels is not None:
+    #     adata.obs["cluster"] = pd.Categorical(node_labels.astype(str))
 
-    # 3. 画图 (如果有 label 信息最好，没有就看有没有聚类结构)
-    # 如果你有原本的 cell_type 标签，可以加到 adata.obs['cell_type'] 里
-    sc.pl.umap(adata, color=None, title="Learned Embeddings", save="_epoch50.png")
-    print("UMAP saved to figures folder.")
+    # # 2. 算一下邻居和 UMAP
+    # print("Running UMAP for visualization...")
+    # sc.pp.neighbors(adata, use_rep='X', n_neighbors=15)
+    # sc.tl.umap(adata)
+
+    # # 3. 画图 (如果有 label 信息最好，没有就看有没有聚类结构)
+    # # 如果你有原本的 cell_type 标签，可以加到 adata.obs['cell_type'] 里
+    # fig_dir = exp_dir / "figures"
+    # fig_dir.mkdir(parents=True, exist_ok=True)
+    # sc.settings.figdir = str(fig_dir)
+    # umap_color = "cluster" if "cluster" in adata.obs else None
+    # sc.pl.umap(adata, color=umap_color, title="Learned Embeddings", save="_epoch50.png")
+    # print(f"UMAP saved to {fig_dir} (suffix: _epoch50.png)")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Hypergraph + KNN 自监督最小测试")
     parser.add_argument("--exp_name", type=str, required=True, help="experiments/ 下实验目录名")
     parser.add_argument("--stage", type=int, default=0)
+    parser.add_argument("--stages", type=str, default="", help="批量训练阶段列表，如 0,1,2")
+    parser.add_argument("--all_stages", action="store_true", help="训练数据集下所有时间点")
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--out_dim", type=int, default=64)
     parser.add_argument("--k", type=int, default=15, help="KNN 的 k")
@@ -318,27 +399,53 @@ def main():
     parser.add_argument("--gmm_covariance", type=str, default="diag", choices=["diag", "full", "tied", "spherical"])
     parser.add_argument("--gmm_prob_thresh", type=float, default=0.5)
     parser.add_argument("--gmm_max_edges", type=int, default=None)
+    parser.add_argument("--gmm_select", type=str, default=None, choices=[None, "bic", "aic"])
+    parser.add_argument("--gmm_min_clusters", type=int, default=2)
+    parser.add_argument("--gmm_max_clusters", type=int, default=30)
     args = parser.parse_args()
 
-    train_one_stage(
-        exp_name=args.exp_name,
-        stage=args.stage,
-        hidden_dim=args.hidden_dim,
-        out_dim=args.out_dim,
-        k=args.k,
-        pca_dim=args.pca_dim,
-        n_programs=args.n_programs,
-        ica_max_iter=args.ica_max_iter,
-        abs_weight=args.abs_weight,
-        keep_percentile=args.keep_percentile,
-        device_pref=args.device,
-        dataset=args.dataset,
-        cluster_mode=args.cluster_mode,
-        n_clusters=args.n_clusters,
-        gmm_covariance=args.gmm_covariance,
-        gmm_prob_thresh=args.gmm_prob_thresh,
-        gmm_max_edges=args.gmm_max_edges,
-    )
+    # 解析 stages
+    stages = []
+    exprs = None
+    if args.all_stages:
+        if not args.dataset:
+            raise ValueError("❌ --all_stages 需要提供 --dataset")
+        exprs, metas, names = load_dataset_pairs(args.dataset)
+        stages = list(range(len(exprs)))
+    elif args.stages.strip():
+        stages = [int(s) for s in args.stages.split(",") if s.strip()]
+    else:
+        stages = [args.stage]
+
+    for st in stages:
+        train_one_stage(
+            exp_name=args.exp_name,
+            stage=st,
+            hidden_dim=args.hidden_dim,
+            out_dim=args.out_dim,
+            k=args.k,
+            pca_dim=args.pca_dim,
+            n_programs=args.n_programs,
+            ica_max_iter=args.ica_max_iter,
+            abs_weight=args.abs_weight,
+            keep_percentile=args.keep_percentile,
+            device_pref=args.device,
+            dataset=args.dataset,
+            cluster_mode=args.cluster_mode,
+            n_clusters=args.n_clusters,
+            gmm_covariance=args.gmm_covariance,
+            gmm_prob_thresh=args.gmm_prob_thresh,
+            gmm_max_edges=args.gmm_max_edges,
+            gmm_select=args.gmm_select,
+            gmm_min_clusters=args.gmm_min_clusters,
+            gmm_max_clusters=args.gmm_max_clusters,
+            exprs=exprs,
+        )
+
+    # 训练完后执行相邻时间点对齐
+    if len(stages) >= 2:
+        exp_dir = get_experiments_root() / args.exp_name
+        align_adjacent_stages(exp_dir, stages, args.n_clusters)
 
 
 if __name__ == "__main__":
